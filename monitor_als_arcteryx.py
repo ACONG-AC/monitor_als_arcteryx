@@ -279,7 +279,7 @@ def compute_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, List[Tup
 
     for k in sorted(new_keys & old_keys):
         o, n = old[k], new[k]
-        op, np = o.get("price"), n.get("price"）
+        op, np = o.get("price"), n.get("price")
         if (isinstance(op, (int, float)) and isinstance(np, (int, float))
                 and not math.isnan(op) and not math.isnan(np) and abs(op - np) >= 0.01):
             diffs["price_change"].append((k, o, n))
