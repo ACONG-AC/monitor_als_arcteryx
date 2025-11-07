@@ -2,14 +2,18 @@ name: Monitor ALS Arc'teryx
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # 每 10 分钟
-  workflow_dispatch: {}      # 手动触发
+    - cron: "*/30 * * * *"   # 每 30 分钟执行一次
+  workflow_dispatch: {}       # 支持手动触发
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write  # 允许提交 snapshot.json
+      contents: write    # 允许提交 snapshot.json
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,7 +35,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           HEADLESS: "1"
-          # ALWAYS_NOTIFY: "0"  # 需要每次都发可设为 1
+          ALWAYS_NOTIFY: "1"   # ← 临时加这一行，强制通知以验证 Discord webhook
         run: |
           python monitor_als_arcteryx.py
 
@@ -39,10 +43,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git diff --quiet -- snapshot.json; then
-            git add snapshot.json
+          git pull --rebase
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No snapshot changes to commit."
+          else
             git commit -m "chore(snapshot): update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
             git push
-          else
-            echo "No snapshot changes to commit."
           fi
