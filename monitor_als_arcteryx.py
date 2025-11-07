@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ALS.com Arc'teryx 监控
-- 上新（新商品/新变体）
-- 价格变化
-- 仅提醒“缺货→到货”
-- 库存数量增加（按尺码对比数量；若无精确数量则用0/1近似）
+ALS.com Arc'teryx 监控（加速 & 单品单条通知）
+- 监控：
+  1) 上新（新商品/新变体）
+  2) 价格变化
+  3) 仅提醒“缺货 → 到货”
+  4) 库存数量增加（按尺码对比；解析不到数量则 0/1 近似）
 
-通知格式：
-• 名称：{title}
-• 货号：{sku}
-• 颜色：{color}
-• 价格：{currency}{price}
-🧾 库存信息：{size1:qty1, size2:qty2, ...}
-{url}
+- 只通知有变化的商品；同一商品的多个变化合并为一条消息
+- 明显提速：拦截静态资源、降低超时、减少等待；支持 MAX_PAGES 限制翻页
 
 Env:
   DISCORD_WEBHOOK_URL   必填：Discord Webhook
-  ALWAYS_NOTIFY=1       可选：即使无变化也发一条（连通性测试）
-  HEADLESS=0            可选：本地调试设为0，CI默认1
-  KEYWORD_FILTER        可选：仅监控包含该关键词的标题
+  HEADLESS=0/1          可选：本地调试 0，CI 1（默认 1）
+  KEYWORD_FILTER        可选：仅监控标题包含该关键词（不区分大小写）
+  MAX_PAGES             可选：限制最多翻页数（整数，默认无限直到两页空页结束）
 """
 
 import json
@@ -33,7 +29,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Set
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -51,6 +47,7 @@ USER_AGENT = (
 def jdump(obj: Any, path: Path):
     """Atomic write to avoid half-written or empty JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    from tempfile import NamedTemporaryFile
     with NamedTemporaryFile('w', delete=False, encoding='utf-8', dir=str(path.parent)) as tmp:
         json.dump(obj, tmp, ensure_ascii=False, indent=2)
         tmp.flush()
@@ -78,7 +75,7 @@ def jload(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def safe_sleep(a=0.3, b=0.9):
+def safe_sleep(a=0.08, b=0.22):
     time.sleep(random.uniform(a, b))
 
 
@@ -98,7 +95,7 @@ def normalize_key(title: str, sku: str, color: str, url: str) -> str:
         return f"{title.lower()}::{color.lower()}"
     m = re.search(r"/([^/]+)/p(?:$|\?)", url)
     slug = m.group(1).lower() if m else re.sub(r"[^a-z0-9]+", "-", (title or url).lower())
-    return f"{slug}::{color.lower() if color else 'na'}"
+    return f"{slug}::{(color or 'na').lower()}"
 
 
 def money_from_text(txt: str):
@@ -108,11 +105,9 @@ def money_from_text(txt: str):
     """
     if not txt:
         return "", math.nan
-    # 常见：'$360.00' 'CA$ 360' 'US$ 200'
     m = re.search(r"([A-Z]{2}\$|\$|C\$|CA\$|US\$|€|£|¥)\s*([0-9]+(?:\.[0-9]{2})?)", txt.replace(",", ""))
     if m:
         return m.group(1), float(m.group(2))
-    # 退路：只找金额
     m = re.search(r"([0-9]+(?:\.[0-9]{2})?)", txt.replace(",", ""))
     if m:
         return "", float(m.group(1))
@@ -137,52 +132,43 @@ def extract_collection_links(page) -> List[str]:
 
 
 def extract_sku(page) -> str:
-    """
-    解析货号（SKU）。常见位置：
-    - 明文 'SKU:'、'Style #'、'Model #'
-    - meta/ld+json 中的 'sku'
-    - 以 X0000... 形式
-    """
-    # 1) DOM 文本
+    """解析 SKU / Style number"""
     try:
         txt = page.locator("body").inner_text()
-        # 优先 X000... 样式
         m = re.search(r"(X\d{9,12})", txt)
         if m:
             return m.group(1).strip()
-        # 通用 SKU/Style/Model
         m = re.search(r"(?:SKU|Style|Model)\s*[:#]\s*([A-Za-z0-9\-]+)", txt, re.I)
         if m:
             return m.group(1).strip()
     except Exception:
         pass
-    # 2) 元数据
+    # 结构化数据兜底
     try:
         metas = page.locator("script[type='application/ld+json']")
-        for i in range(metas.count()):
+        for i in range(min(8, metas.count())):
             raw = metas.nth(i).inner_text()
-            for obj in json.loads(raw if raw.strip().startswith("{") else "{}"),:
-                if isinstance(obj, dict):
-                    sku = obj.get("sku") or ""
-                    if sku:
-                        return str(sku).strip()
+            if not raw.strip():
+                continue
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                sku = obj.get("sku")
+                if sku:
+                    return str(sku).strip()
+            elif isinstance(obj, list):
+                for it in obj:
+                    if isinstance(it, dict) and it.get("sku"):
+                        return str(it["sku"]).strip()
     except Exception:
         pass
     return ""
 
 
 def extract_color(page) -> str:
-    """
-    解析当前选中颜色。常见：
-    - 'Color: Trail Magic'
-    - 颜色选择器的 aria-pressed / selected 文本
-    """
-    # 1) Label 形式
+    """解析颜色"""
     try:
-        # 查带 "Color" 的文本
         matches = page.locator("text=/Color\\s*:/i")
         if matches.count():
-            # 取包含冒号的这一行
             line = matches.first.evaluate("el => el.parentElement ? el.parentElement.innerText : el.innerText")
             if line:
                 m = re.search(r"Color\s*:\s*(.+)", line, re.I)
@@ -190,22 +176,20 @@ def extract_color(page) -> str:
                     return norm_spaces(m.group(1))
     except Exception:
         pass
-    # 2) 颜色按钮（选中项）
     try:
         selected = page.locator("[aria-pressed='true'], [aria-selected='true']")
-        for i in range(min(selected.count(), 10)):
+        for i in range(min(selected.count(), 8)):
             t = norm_spaces(selected.nth(i).inner_text())
             if t and len(t) <= 40 and not re.search(r"(Add to cart|Add to bag)", t, re.I):
                 return t
     except Exception:
         pass
-    # 3) 标题中带颜色
     try:
-        title = page.locator("h1").first.inner_text() if page.locator("h1").count() else ""
-        # 经验：颜色有时在标题末尾括号里
-        m = re.search(r"\(([^()]+)\)$", title)
-        if m:
-            return norm_spaces(m.group(1))
+        if page.locator("h1").count():
+            title = page.locator("h1").first.inner_text()
+            m = re.search(r"\(([^()]+)\)$", title)
+            if m:
+                return norm_spaces(m.group(1))
     except Exception:
         pass
     return ""
@@ -213,15 +197,12 @@ def extract_color(page) -> str:
 
 def extract_price(page) -> Tuple[str, float]:
     """解析货币与价格"""
-    # 尝试多个选择器
-    candidates = [
+    for sel in [
         "[class*='price']",
         "[data-test*='price']",
-        "div:has-text('$')",
-        "div:has-text('US$'), div:has-text('CA$'), div:has-text('C$'), div:has-text('¥'), div:has-text('€'), div:has-text('£')",
+        "div:has-text('$'), div:has-text('CA$'), div:has-text('US$'), div:has-text('€'), div:has-text('£'), div:has-text('¥')",
         "body",
-    ]
-    for sel in candidates:
+    ]:
         try:
             if page.locator(sel).count():
                 txt = page.locator(sel).first.inner_text()
@@ -235,52 +216,49 @@ def extract_price(page) -> Tuple[str, float]:
 
 def extract_sizes_with_qty(page) -> Dict[str, int]:
     """
-    返回 dict: {size_text: qty_int}
+    返回 {size_text: qty_int}
     解析顺序：
-    1) 带数量的数据属性：data-available-qty / data-inventory / data-qty / data-stock
-    2) 内嵌 JSON（variants / options）
-    3) 回退：按钮可点=1，不可点=0
+      1) data-available-qty / data-inventory / data-qty / data-stock
+      2) 页面脚本中的 "size":"XL","inventory_quantity":3
+      3) 回退：按钮可点=1，不可点=0
     """
     sizes: Dict[str, int] = {}
 
-    # 1) 按钮/选项带数据属性
+    # 1) data-* 属性
     try:
         btns = page.locator("button, [role='option'], [data-size]")
-        for i in range(min(200, btns.count())):
+        for i in range(min(btns.count(), 150)):
             el = btns.nth(i)
-            label = norm_spaces(el.inner_text())
-            if not label or len(label) > 10:  # 过滤非尺码
+            label = norm_spaces(el.inner_text()).upper()
+            if not label or len(label) > 10:
                 continue
             if not re.fullmatch(r"(XXS|XS|S|M|L|XL|XXL|XXXL|[\d]{1,2})", label, re.I):
                 continue
             qty_attr = None
             for attr in ("data-available-qty", "data-inventory", "data-qty", "data-stock", "data-quantity"):
                 v = el.get_attribute(attr)
-                if v and re.fullmatch(r"\d+", v.strip()):
+                if v and re.fullmatch(r"-?\d+", v.strip()):
                     qty_attr = int(v.strip())
                     break
             if qty_attr is not None:
-                sizes[label.upper()] = max(0, qty_attr)
+                sizes[label] = max(0, qty_attr)
     except Exception:
         pass
 
-    # 2) 内嵌 JSON（有时页面会有 variants 列表）
+    # 2) 脚本中的 JSON
     if not sizes:
         try:
             scripts = page.locator("script")
-            for i in range(min(20, scripts.count())):
+            for i in range(min(12, scripts.count())):
                 raw = scripts.nth(i).inner_text()
                 if not raw or ("variant" not in raw.lower() and "inventory" not in raw.lower()):
                     continue
-                # 粗暴找出类似 ... "size":"XL","inventory_quantity":3 ...
                 for m in re.finditer(r'"size"\s*:\s*"(?P<size>[^"]+?)"[^}]*?"inventory[^"]*?"\s*:\s*(?P<qty>-?\d+)', raw, re.I | re.S):
-                    size = m.group("size").strip().upper()
-                    qty = int(m.group("qty"))
-                    sizes[size] = max(0, qty)
+                    sizes[m.group("size").upper()] = max(0, int(m.group("qty")))
         except Exception:
             pass
 
-    # 3) 回退：可点=1，不可点=0（保证能做“缺货→到货/数量增加”的判断）
+    # 3) 回退：可点=1，不可点=0
     if not sizes:
         try:
             candidates = page.locator(
@@ -312,10 +290,9 @@ def parse_product_detail(page) -> Dict[str, Any]:
         "currency": "",
         "price": math.nan,
         "sizes": {},       # {size: qty_int}
-        "in_stock": False, # 是否整体可买（任一尺码 qty>0 即 True）
+        "in_stock": False, # 任一尺码 qty>0 即 True
     }
 
-    # 标题
     try:
         if page.locator("h1").count():
             data["title"] = norm_spaces(page.locator("h1").first.inner_text())
@@ -324,19 +301,16 @@ def parse_product_detail(page) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 货号
     try:
         data["sku"] = extract_sku(page)
     except Exception:
         pass
 
-    # 颜色
     try:
         data["color"] = extract_color(page)
     except Exception:
         pass
 
-    # 价格
     try:
         cur, pr = extract_price(page)
         data["currency"] = cur
@@ -344,7 +318,6 @@ def parse_product_detail(page) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 尺码与数量
     try:
         sizes = extract_sizes_with_qty(page)
         data["sizes"] = sizes
@@ -355,25 +328,43 @@ def parse_product_detail(page) -> Dict[str, Any]:
     return data
 
 
-def scrape_all_products(headless=True, timeout_ms=15000) -> Dict[str, Any]:
-    """遍历集合页 → 逐个 PDP 解析 → 返回以 variant key 为键的 dict"""
+def scrape_all_products(headless=True, timeout_ms=8000) -> Dict[str, Any]:
+    """遍历集合页 → 逐个 PDP 解析 → 返回以 variant key 为键的 dict（提速版）"""
     result: Dict[str, Any] = {}
     keyword = os.environ.get("KEYWORD_FILTER", "").strip().lower()
+    max_pages = None
+    try:
+        if os.environ.get("MAX_PAGES"):
+            max_pages = max(1, int(os.environ["MAX_PAGES"]))
+    except Exception:
+        max_pages = None
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = pw.chromium.launch(headless=headless, args=["--disable-http-cache"])
         ctx = browser.new_context(user_agent=USER_AGENT, locale="en-US")
+        ctx.set_default_timeout(timeout_ms)
+
+        # 拦截非必要资源以提速
+        def _route(route):
+            req = route.request
+            if req.resource_type in ("image", "media", "font", "stylesheet"):
+                return route.abort()
+            return route.continue_()
+        ctx.route("**/*", _route)
+
         page = ctx.new_page()
 
         page_idx = 1
         empty_hits = 0
-        seen_urls = set()
+        seen_urls: Set[str] = set()
 
         while True:
+            if max_pages is not None and page_idx > max_pages:
+                break
             url = COLLECTION_URL if page_idx == 1 else f"{COLLECTION_URL}?page={page_idx}"
             try:
-                page.goto(url, timeout=timeout_ms)
-                page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+                page.goto(url)
+                page.wait_for_load_state("domcontentloaded")
             except PWTimeout:
                 print(f"[page] timeout loading {url}")
                 empty_hits += 1
@@ -397,14 +388,14 @@ def scrape_all_products(headless=True, timeout_ms=15000) -> Dict[str, Any]:
                 if href in seen_urls:
                     continue
                 seen_urls.add(href)
-                safe_sleep(0.4, 1.0)
+                safe_sleep()
 
                 ok = False
-                for attempt in range(3):
+                for attempt in range(2):  # 更少重试以提速
                     try:
-                        page.goto(href, timeout=timeout_ms)
-                        page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
-                        safe_sleep(0.2, 0.6)
+                        page.goto(href)
+                        page.wait_for_load_state("domcontentloaded")
+                        safe_sleep()
                         pdata = parse_product_detail(page)
                         title = pdata.get("title", "")
                         color = pdata.get("color", "")
@@ -420,9 +411,8 @@ def scrape_all_products(headless=True, timeout_ms=15000) -> Dict[str, Any]:
                             break
                     except Exception as e:
                         print(f"[detail] error {href}: {e}")
-                        safe_sleep(0.7, 1.5)
+                        safe_sleep(0.2, 0.4)
                 if not ok:
-                    # 记录最少信息以免丢失
                     key = normalize_key("", "", "", href)
                     result[key] = {
                         "title": "",
@@ -452,11 +442,10 @@ def scrape_all_products(headless=True, timeout_ms=15000) -> Dict[str, Any]:
 def compute_diff(old: Dict[str, Any], new: Dict[str, Any]):
     """
     返回：
-      new_items:        新商品/新变体
-      price_changes:    价格变化
-      restocks:         缺货→到货（old.in_stock=False & new.in_stock=True）
-      stock_increases:  库存数量增加（按尺码对比；若解析不到数量，用0/1）
-                         元素结构：[(key, old, new, increased_sizes_dict)]
+      new_items:        [(k, n)]
+      price_changes:    [(k, o, n)]
+      restocks:         [(k, o, n)]
+      stock_increases:  [(k, o, n, increased_sizes_dict)]
     """
     new_items = []
     price_changes = []
@@ -468,12 +457,12 @@ def compute_diff(old: Dict[str, Any], new: Dict[str, Any]):
 
     # 上新（含新变体）
     for k in sorted(new_keys - old_keys):
-        new_items.append((k, None, new[k]))
+        new_items.append((k, new[k]))
 
     # 交集对比
     for k in sorted(new_keys & old_keys):
-        o = old[k] or {}
-        n = new[k] or {}
+        o = old.get(k, {})
+        n = new.get(k, {})
 
         # 价格变化
         op, np = o.get("price"), n.get("price")
@@ -495,7 +484,6 @@ def compute_diff(old: Dict[str, Any], new: Dict[str, Any]):
                 if int(nqty) > int(oqty):
                     increased[size] = int(nqty)
             except Exception:
-                # 非法值按0/1逻辑
                 if (nqty and not oqty):
                     increased[size] = 1
         if increased:
@@ -512,8 +500,7 @@ def compute_diff(old: Dict[str, Any], new: Dict[str, Any]):
 def _fmt_currency_price(currency: str, price: float) -> str:
     if isinstance(price, (int, float)) and not math.isnan(price):
         cur = (currency or "").strip()
-        # 统一去掉多余空格：'CA$ ' → 'CA$ '
-        return f"{cur} {price:.2f}".strip()
+        return f"{cur} {price:.2f}".strip() if cur else f"{price:.2f}"
     return "N/A"
 
 
@@ -524,7 +511,6 @@ def _fmt_sizes_line(sizes: Dict[str, int], only_keys: List[str] = None, limit: i
             if k in sizes:
                 items.append(f"{k}:{sizes[k]}")
     else:
-        # 仅展示有库存（>0）的尺码，最多 limit 个
         for k, v in sizes.items():
             if v and v > 0:
                 items.append(f"{k}:{v}")
@@ -533,74 +519,44 @@ def _fmt_sizes_line(sizes: Dict[str, int], only_keys: List[str] = None, limit: i
     return "，".join(items) if items else "无"
 
 
-def format_discord_message(diffs) -> Dict[str, Any]:
-    """按指定格式组织为 Discord 嵌入消息"""
-    lines: List[str] = []
+def build_item_message(n: Dict[str, Any], reasons: List[str], increased_sizes: List[str] = None) -> Dict[str, Any]:
+    """
+    为单个商品构建 Discord payload（一个商品一条消息）
+    reasons: ["上新", "价格变化", "缺货→到货", "库存增加"]
+    increased_sizes: 当包含“库存增加”时，只展示有增长的尺码列表（可选）
+    """
+    nm = n.get("title") or "-"
+    sku = n.get("sku") or "-"
+    color = n.get("color") or "-"
+    price = _fmt_currency_price(n.get("currency", ""), n.get("price"))
+    sizes = n.get("sizes") or {}
 
-    def block(n: Dict[str, Any], title: str):
-        nm = n.get("title") or "-"
-        sku = n.get("sku") or "-"
-        color = n.get("color") or "-"
-        price = _fmt_currency_price(n.get("currency", ""), n.get("price"))
-        sizes = n.get("sizes") or {}
-        # 按你的示例格式输出
-        lines.append(f"• 名称：{nm}")
-        lines.append(f"• 货号：{sku}")
-        lines.append(f"• 颜色：{color}")
-        lines.append(f"• 价格：{price}")
-        lines.append(f"🧾 库存信息：{_fmt_sizes_line(sizes)}")
-        lines.append(f"{n.get('url')}")
-        lines.append("")  # 空行分隔
+    if increased_sizes:
+        sizes_line = _fmt_sizes_line(sizes, only_keys=increased_sizes)
+    else:
+        sizes_line = _fmt_sizes_line(sizes)
 
-    # 上新
-    if diffs["new_items"]:
-        lines.append("**上新（新商品/新变体）**")
-        for k, _, n in diffs["new_items"][:20]:
-            block(n, "上新")
+    header = "、".join(reasons)
+    content = "\n".join([
+        f"**{header}**",
+        f"• 名称：{nm}",
+        f"• 货号：{sku}",
+        f"• 颜色：{color}",
+        f"• 价格：{price}",
+        f"🧾 库存信息：{sizes_line}",
+        f"{n.get('url')}",
+    ])
 
-    # 价格变化
-    if diffs["price_changes"]:
-        lines.append("**价格变化**")
-        for k, o, n in diffs["price_changes"][:20]:
-            block(n, "价格变化")
-
-    # 缺货→到货
-    if diffs["restocks"]:
-        lines.append("**缺货 → 到货**")
-        for k, o, n in diffs["restocks"][:20]:
-            block(n, "到货")
-
-    # 库存数量增加（仅展示增加的尺码）
-    if diffs["stock_increases"]:
-        lines.append("**库存数量增加**")
-        for k, o, n, inc in diffs["stock_increases"][:20]:
-            nm = n.get("title") or "-"
-            sku = n.get("sku") or "-"
-            color = n.get("color") or "-"
-            price = _fmt_currency_price(n.get("currency", ""), n.get("price"))
-            sizes = n.get("sizes") or {}
-            inc_keys = list(inc.keys())
-            lines.append(f"• 名称：{nm}")
-            lines.append(f"• 货号：{sku}")
-            lines.append(f"• 颜色：{color}")
-            lines.append(f"• 价格：{price}")
-            lines.append(f"🧾 库存信息：{_fmt_sizes_line(sizes, only_keys=inc_keys)}")
-            lines.append(f"{n.get('url')}")
-            lines.append("")
-
-    content = "\n".join(lines) if lines else "本次扫描未发现变化。"
-
-    payload = {
+    return {
         "content": None,
         "embeds": [{
-            "title": "Al's | Arc'teryx 监控结果",
-            "description": content[:4000],  # 保险起见限制描述长度
+            "title": "Al's | Arc'teryx 监控",
+            "description": content[:4000],
             "timestamp": datetime.utcnow().isoformat(),
             "color": 0x00AAFF,
             "footer": {"text": "als.com 价格/上新/库存监控"},
         }]
     }
-    return payload
 
 
 def send_discord(payload: dict) -> None:
@@ -631,29 +587,25 @@ def send_discord(payload: dict) -> None:
         ),
     }
 
-    for attempt in range(4):
+    for attempt in range(3):
         req = urllib.request.Request(webhook, data=data, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 body = resp.read().decode("utf-8", "ignore")
-                print(f"Discord sent OK: {resp.status} {body[:200]}")
+                print(f"Discord sent OK: {resp.status} {body[:120]}")
                 return
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", "ignore")
-            print(f"Discord HTTPError: {e.code} {body[:300]}")
-            if e.code in (429, 403, 502, 503) and attempt < 3:
-                wait = max(2 ** attempt, float(e.headers.get("Retry-After", "0") or 0))
-                print(f"等待 {wait} 秒后重试...")
+            print(f"Discord HTTPError: {e.code} {body[:200]}")
+            if e.code in (429, 403, 502, 503) and attempt < 2:
+                wait = max(1.5 * (attempt + 1), float(e.headers.get("Retry-After", "0") or 0))
                 time.sleep(wait)
                 continue
-            print("放弃重试。")
             return
         except Exception as ex:
             print(f"Discord error: {repr(ex)}")
-            if attempt < 3:
-                wait = 2 ** attempt
-                print(f"等待 {wait} 秒后重试...")
-                time.sleep(wait)
+            if attempt < 2:
+                time.sleep(1.5 * (attempt + 1))
                 continue
             return
 
@@ -669,23 +621,46 @@ def main():
     old = jload(SNAPSHOT_PATH)
     print(f"Loaded {len(old)} items from snapshot.")
 
+    # --- 抓取（提速配置见 scrape_all_products） ---
     new = scrape_all_products(headless=headless)
     print(f"Scraped {len(new)} items from website.")
 
+    # --- 计算差异 ---
     diffs = compute_diff(old, new)
-    print("Diff summary:",
-          f"new={len(diffs['new_items'])},",
-          f"price={len(diffs['price_changes'])},",
-          f"restock={len(diffs['restocks'])},",
-          f"stock_inc={len(diffs['stock_increases'])}")
+    total_changed_keys: Set[str] = set()
 
+    # 将变化归并到“每个商品一条”的模型
+    # 先构建 key -> reasons 映射；库存增加需要记录增长的尺码名
+    reasons_map: Dict[str, List[str]] = {}
+    increased_sizes_map: Dict[str, List[str]] = {}
+
+    for k, n in diffs["new_items"]:
+        reasons_map.setdefault(k, []).append("上新")
+    for k, o, n in diffs["price_changes"]:
+        reasons_map.setdefault(k, []).append("价格变化")
+    for k, o, n in diffs["restocks"]:
+        reasons_map.setdefault(k, []).append("缺货→到货")
+    for k, o, n, inc in diffs["stock_increases"]:
+        reasons_map.setdefault(k, []).append("库存增加")
+        increased_sizes_map[k] = list(inc.keys())
+
+    total_changed_keys = set(reasons_map.keys())
+    print("Changed items:", len(total_changed_keys))
+
+    # --- 写回快照 ---
     jdump(new, SNAPSHOT_PATH)
 
-    if (sum(len(v) for v in diffs.values()) > 0) or os.environ.get("ALWAYS_NOTIFY", "0") == "1":
-        payload = format_discord_message(diffs)
-        send_discord(payload)
+    # --- 只对有变化的商品逐条发消息 ---
+    if total_changed_keys:
+        # 注意：一个商品一条通知，包含合并的 reason
+        for k in sorted(total_changed_keys):
+            n = new.get(k) or {}
+            reasons = reasons_map.get(k, [])
+            inc_sizes = increased_sizes_map.get(k)
+            payload = build_item_message(n, reasons=reasons, increased_sizes=inc_sizes)
+            send_discord(payload)
     else:
-        print("No diff; not notifying.")
+        print("No changes; no notifications.")
 
     return 0
 
