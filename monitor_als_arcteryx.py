@@ -279,5 +279,137 @@ def compute_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, List[Tup
 
     for k in sorted(new_keys & old_keys):
         o, n = old[k], new[k]
+        op, np = o.get("price"), n.get("price"）
+        if (isinstance(op, (int, float)) and isinstance(np, (int, float))
+                and not math.isnan(op) and not math.isnan(np) and abs(op - np) >= 0.01):
+            diffs["price_change"].append((k, o, n))
+        oa = o.get("sizes_available", 0) or 0
+        na = n.get("sizes_available", 0) or 0
+        if na > oa:
+            diffs["stock_increase"].append((k, o, n))
+    return diffs
+
+
+def format_discord_message(diffs: Dict[str, List[Tuple[str, Dict[str, Any], Dict[str, Any]]]]) -> Dict[str, Any]:
+    def line_for_new(item):
+        _, _, n = item
+        p = n.get("price")
+        price_str = f"${p:.2f}" if isinstance(p, (int, float)) and not math.isnan(p) else "N/A"
+        return f"🆕 上新 | {n.get('title')} | {price_str}\n{n.get('url')}"
+
+    def line_for_price(item):
+        _, o, n = item
         op, np = o.get("price"), n.get("price")
-        if (isinstance(op, (int, float
+        if all(isinstance(x, (int, float)) and not math.isnan(x) for x in [op, np]):
+            arrow = "⬇️" if np < op else "⬆️"
+            return f"💲 价格变化 | {n.get('title')} | {arrow} {op:.2f} → {np:.2f}\n{n.get('url')}"
+        return f"💲 价格变化 | {n.get('title')}\n{n.get('url')}"
+
+    def line_for_stock(item):
+        _, o, n = item
+        oa, na = o.get("sizes_available", 0), n.get("sizes_available", 0)
+        return f"📦 库存增加 | {n.get('title')} | 可售尺码 {oa} → {na}\n{n.get('url')}"
+
+    sections = []
+    if diffs["new"]:
+        sections.append("**上新**\n" + "\n\n".join(line_for_new(x) for x in diffs["new"][:15]))
+    if diffs["price_change"]:
+        sections.append("**价格变化**\n" + "\n\n".join(line_for_price(x) for x in diffs["price_change"][:15]))
+    if diffs["stock_increase"]:
+        sections.append("**库存增加**\n" + "\n\n".join(line_for_stock(x) for x in diffs["stock_increase"][:15]))
+
+    content = "\n\n".join(sections) if sections else "本次扫描未发现变化。"
+    return {
+        "content": None,
+        "embeds": [{
+            "title": "Al's | Arc'teryx 监控结果",
+            "description": content,
+            "timestamp": datetime.utcnow().isoformat(),
+            "color": 0x00AAFF,
+            "footer": {"text": "als.com 价格/上新/库存监控"},
+        }]
+    }
+
+
+def send_discord(payload: dict) -> None:
+    """
+    Send Discord webhook notification with safe headers and retries.
+    (Final fixed version — no Origin/Referer)
+    """
+    import urllib.request, urllib.error
+
+    webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if not webhook:
+        print("WARN: DISCORD_WEBHOOK_URL 未配置，跳过通知。")
+        return
+
+    webhook = webhook.replace("discordapp.com", "discord.com")
+    if "?" not in webhook:
+        webhook += "?wait=true"
+
+    data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0 Safari/537.36"
+        ),
+    }
+
+    for attempt in range(4):
+        req = urllib.request.Request(webhook, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                body = resp.read().decode("utf-8", "ignore")
+                print(f"Discord sent OK: {resp.status} {body[:200]}")
+                return
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "ignore")
+            print(f"Discord HTTPError: {e.code} {body[:300]}")
+            if e.code in (429, 403, 502, 503) and attempt < 3:
+                wait = max(2 ** attempt, float(e.headers.get("Retry-After", "0") or 0))
+                print(f"等待 {wait} 秒后重试...")
+                time.sleep(wait)
+                continue
+            print("放弃重试。")
+            return
+        except Exception as ex:
+            print(f"Discord error: {repr(ex)}")
+            if attempt < 3:
+                wait = 2 ** attempt
+                print(f"等待 {wait} 秒后重试...")
+                time.sleep(wait)
+                continue
+            return
+
+
+def main():
+    print(f"CWD={os.getcwd()}  SNAPSHOT_PATH={SNAPSHOT_PATH.resolve()}")
+    headless = os.environ.get("HEADLESS", "1") != "0"
+
+    old = jload(SNAPSHOT_PATH)
+    print(f"Loaded {len(old)} items from snapshot.")
+
+    new = scrape_all_products(headless=headless)
+    print(f"Scraped {len(new)} items from website.")
+
+    diffs = compute_diff(old, new)
+    total_changes = sum(len(v) for v in diffs.values())
+    print(f"Found changes: {total_changes} "
+          f"(new={len(diffs['new'])}, price={len(diffs['price_change'])}, stock={len(diffs['stock_increase'])})")
+
+    jdump(new, SNAPSHOT_PATH)
+
+    if total_changes > 0 or os.environ.get("ALWAYS_NOTIFY", "0") == "1":
+        payload = format_discord_message(diffs)
+        send_discord(payload)
+    else:
+        print("No diff; not notifying.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
