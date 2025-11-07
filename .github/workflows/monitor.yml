@@ -2,7 +2,7 @@ name: Monitor ALS Arc'teryx
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 每 30 分钟
+    - cron: "*/30 * * * *"   # 每 30 分钟运行一次
   workflow_dispatch: {}       # 支持手动触发
 
 # 防止并发运行互相覆盖 snapshot.json
@@ -35,10 +35,9 @@ jobs:
 
       - name: Run monitor
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          HEADLESS: "1"
-          # 验证 Discord 能否收到消息时，临时打开下一行；验证通过后删掉/注释掉
-          # ALWAYS_NOTIFY: "1"
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}  # 在仓库 Settings → Secrets 配置
+          HEADLESS: "1"                                           # CI 环境保持无头
+          # NOTIFY_INTERVAL_SEC: "0.1"                            # 可按需调大（避免 429），默认 0.1 秒
         run: |
           python monitor_als_arcteryx.py
 
@@ -48,17 +47,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 关键：在拉取前自动暂存工作区改动，避免 “cannot pull with rebase: You have unstaged changes”
+          # 关键：拉取前自动暂存本地改动，避免 “cannot pull with rebase: You have unstaged changes”
           git pull --rebase --autostash
 
-          # 只需提交快照即可；若你还有其他生成文件，改成 git add -A
+          # 仅提交快照（如有多个生成文件可改为 git add -A）
           git add snapshot.json || true
 
           if git diff --cached --quiet; then
             echo "No snapshot changes to commit."
           else
             git commit -m "chore(snapshot): update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            # 简单 push 重试（网络抖动/短暂拒绝时）
+            # 简单 push 重试（网络抖动/权限偶发失败时）
             n=0
             until [ $n -ge 3 ]; do
               git push && break
