@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ALS.com Arc'teryx 监控（单品单条通知 / 无分页与首轮限制）
+ALS.com Arc'teryx 监控（稳定键=规范化URL / 单品单条通知 / 只发有变化）
 监控：
   1) 上新（新商品/新变体）
   2) 价格变化
@@ -11,7 +11,7 @@ ALS.com Arc'teryx 监控（单品单条通知 / 无分页与首轮限制）
 行为：
   - 只通知有变化的商品
   - 一个商品一条通知（同一商品的多种变化合并为一条）
-  - 不限制翻页，不限制首轮通知数量
+  - 使用“规范化 PDP URL 路径”作为稳定 key，避免因标题/SKU/颜色抖动导致重复上新
 
 Env:
   DISCORD_WEBHOOK_URL   必填：Discord Webhook
@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Dict, Any, List, Tuple, Set
+from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
@@ -87,31 +88,23 @@ def norm_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
 
-def normalize_key(title: str, sku: str, color: str, url: str) -> str:
-    """优先用 sku+color，其次 title+color，最后回退 url 段。"""
-    if sku and color:
-        return f"{sku.lower()}::{color.lower()}"
-    if title and color:
-        return f"{title.lower()}::{color.lower()}"
-    m = re.search(r"/([^/]+)/p(?:$|\?)", url)
-    slug = m.group(1).lower() if m else re.sub(r"[^a-z0-9]+", "-", (title or url).lower())
-    return f"{slug}::{(color or 'na').lower()}"
+def canonicalize_url(u: str) -> str:
+    """
+    取 als.com PDP 的规范化 URL：小写、去 query/fragment、去尾部斜杠。
+    例如：https://www.als.com/arcteryx-atom-hoody-mens/p?color=Trail -> /arcteryx-atom-hoody-mens/p
+    """
+    try:
+        p = urlparse(u)
+        path = (p.path or "").rstrip("/").lower()
+        return path
+    except Exception:
+        return (u or "").split("?")[0].split("#")[0].rstrip("/").lower()
 
 
-def money_from_text(txt: str) -> Tuple[str, float]:
-    """
-    抽取货币符号与金额，例如 '$ 360.00' 或 'CA$ 360'。
-    返回 (currency_symbol, price_float)；若失败 price=nan, symbol=''
-    """
-    if not txt:
-        return "", math.nan
-    m = re.search(r"([A-Z]{2}\$|\$|C\$|CA\$|US\$|€|£|¥)\s*([0-9]+(?:\.[0-9]{2})?)", txt.replace(",", ""))
-    if m:
-        return m.group(1), float(m.group(2))
-    m = re.search(r"([0-9]+(?:\.[0-9]{2})?)", txt.replace(",", ""))
-    if m:
-        return "", float(m.group(1))
-    return "", math.nan
+def normalize_key_from_url(u: str) -> str:
+    """仅用规范化 URL 路径作为 key，避免因 title/sku/color 抖动导致重复“上新”判断。"""
+    path = canonicalize_url(u)
+    return path if path else (u or "").lower()
 
 
 # --------------------------
@@ -193,6 +186,22 @@ def extract_color(page) -> str:
     except Exception:
         pass
     return ""
+
+
+def money_from_text(txt: str) -> Tuple[str, float]:
+    """
+    抽取货币符号与金额，例如 '$ 360.00' 或 'CA$ 360'。
+    返回 (currency_symbol, price_float)；若失败 price=nan, symbol=''
+    """
+    if not txt:
+        return "", math.nan
+    m = re.search(r"([A-Z]{2}\$|\$|C\$|CA\$|US\$|€|£|¥)\s*([0-9]+(?:\.[0-9]{2})?)", txt.replace(",", ""))
+    if m:
+        return m.group(1), float(m.group(2))
+    m = re.search(r"([0-9]+(?:\.[0-9]{2})?)", txt.replace(",", ""))
+    if m:
+        return "", float(m.group(1))
+    return "", math.nan
 
 
 def extract_price(page) -> Tuple[str, float]:
@@ -329,7 +338,7 @@ def parse_product_detail(page) -> Dict[str, Any]:
 
 
 def scrape_all_products(headless: bool = True, timeout_ms: int = 8000) -> Dict[str, Any]:
-    """遍历集合页 → 逐个 PDP 解析 → 返回以 variant key 为键的 dict（加速版）。"""
+    """遍历集合页 → 逐个 PDP 解析 → 返回以 规范化URL 为键 的 dict（加速且稳定 key）。"""
     result: Dict[str, Any] = {}
     keyword = os.environ.get("KEYWORD_FILTER", "").strip().lower()
 
@@ -383,29 +392,37 @@ def scrape_all_products(headless: bool = True, timeout_ms: int = 8000) -> Dict[s
                 safe_sleep()
 
                 ok = False
+                final_url = href
                 for attempt in range(2):  # 少量重试以提速
                     try:
                         page.goto(href)
                         page.wait_for_load_state("domcontentloaded")
                         safe_sleep()
+                        final_url = page.url  # 取最终跳转后的 URL
                         pdata = parse_product_detail(page)
                         title = pdata.get("title", "")
-                        color = pdata.get("color", "")
-                        sku = pdata.get("sku", "")
                         if keyword and keyword not in (title or "").lower():
-                            ok = True
+                            ok = True  # 不计为失败，只是不纳入结果
                             break
+
+                        # 用“规范化URL路径”作为 key 与展示 URL
+                        canon_path = canonicalize_url(final_url)
+                        key = normalize_key_from_url(final_url)
+                        display_url = "https://www.als.com" + canon_path if canon_path.startswith("/") else final_url.split("?")[0].split("#")[0]
+
                         if title:
-                            key = normalize_key(title, sku, color, href)
-                            pdata.update({"url": href, "last_seen": now_iso(), "key": key})
+                            pdata.update({"url": display_url, "last_seen": now_iso(), "key": key})
                             result[key] = pdata
                             ok = True
                             break
                     except Exception as e:
                         print(f"[detail] error {href}: {e}")
                         safe_sleep(0.2, 0.4)
+
                 if not ok:
-                    key = normalize_key("", "", "", href)
+                    canon_path = canonicalize_url(final_url or href)
+                    key = normalize_key_from_url(final_url or href)
+                    display_url = "https://www.als.com" + canon_path if canon_path.startswith("/") else (final_url or href).split("?")[0].split("#")[0]
                     result[key] = {
                         "title": "",
                         "sku": "",
@@ -414,7 +431,7 @@ def scrape_all_products(headless: bool = True, timeout_ms: int = 8000) -> Dict[s
                         "price": math.nan,
                         "sizes": {},
                         "in_stock": False,
-                        "url": href,
+                        "url": display_url,
                         "last_seen": now_iso(),
                         "key": key,
                         "note": "parse_failed",
@@ -590,7 +607,7 @@ def send_discord(payload: dict) -> None:
     except Exception as ex:
         print(f"Discord error: {repr(ex)}")
 
-    # 发送间隔，避免频繁 429
+    # 发送间隔，避免频繁 429（可按需调大）
     time.sleep(float(os.environ.get("NOTIFY_INTERVAL_SEC", "0.1")))
 
 
