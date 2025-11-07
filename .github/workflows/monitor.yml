@@ -2,9 +2,10 @@ name: Monitor ALS Arc'teryx
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 每 30 分钟执行一次
+    - cron: "*/30 * * * *"   # 每 30 分钟
   workflow_dispatch: {}       # 支持手动触发
 
+# 防止并发运行互相覆盖 snapshot.json
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -13,7 +14,8 @@ jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write    # 允许提交 snapshot.json
+      contents: write   # 允许提交 snapshot.json
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,19 +37,33 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           HEADLESS: "1"
-          ALWAYS_NOTIFY: "1"   # ← 临时加这一行，强制通知以验证 Discord webhook
+          # 验证 Discord 能否收到消息时，临时打开下一行；验证通过后删掉/注释掉
+          # ALWAYS_NOTIFY: "1"
         run: |
           python monitor_als_arcteryx.py
 
       - name: Commit snapshot if changed
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase
-          git add -A
+
+          # 关键：在拉取前自动暂存工作区改动，避免 “cannot pull with rebase: You have unstaged changes”
+          git pull --rebase --autostash
+
+          # 只需提交快照即可；若你还有其他生成文件，改成 git add -A
+          git add snapshot.json || true
+
           if git diff --cached --quiet; then
             echo "No snapshot changes to commit."
           else
             git commit -m "chore(snapshot): update $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
-            git push
+            # 简单 push 重试（网络抖动/短暂拒绝时）
+            n=0
+            until [ $n -ge 3 ]; do
+              git push && break
+              n=$((n+1))
+              echo "git push failed, retry $n/3 in 5s..."
+              sleep 5
+            done
           fi
