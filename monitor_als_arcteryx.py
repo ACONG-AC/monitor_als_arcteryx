@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ALS.com Arc'teryx 监控（加速 & 单品单条通知）
-- 监控：
+ALS.com Arc'teryx 监控（单品单条通知 / 无分页与首轮限制）
+监控：
   1) 上新（新商品/新变体）
   2) 价格变化
   3) 仅提醒“缺货 → 到货”
-  4) 库存数量增加（按尺码对比；解析不到数量则 0/1 近似）
+  4) 库存数量增加（逐尺码对比；解析不到数量则 0/1 近似）
 
-- 只通知有变化的商品；同一商品的多个变化合并为一条消息
-- 明显提速：拦截静态资源、降低超时、减少等待；支持 MAX_PAGES 限制翻页
+行为：
+  - 只通知有变化的商品
+  - 一个商品一条通知（同一商品的多种变化合并为一条）
+  - 不限制翻页，不限制首轮通知数量
 
 Env:
   DISCORD_WEBHOOK_URL   必填：Discord Webhook
   HEADLESS=0/1          可选：本地调试 0，CI 1（默认 1）
   KEYWORD_FILTER        可选：仅监控标题包含该关键词（不区分大小写）
-  MAX_PAGES             可选：限制最多翻页数（整数，默认无限直到两页空页结束）
 """
 
 import json
@@ -44,10 +45,9 @@ USER_AGENT = (
 # Utilities
 # --------------------------
 
-def jdump(obj: Any, path: Path):
+def jdump(obj: Any, path: Path) -> None:
     """Atomic write to avoid half-written or empty JSON."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    from tempfile import NamedTemporaryFile
     with NamedTemporaryFile('w', delete=False, encoding='utf-8', dir=str(path.parent)) as tmp:
         json.dump(obj, tmp, ensure_ascii=False, indent=2)
         tmp.flush()
@@ -75,7 +75,7 @@ def jload(path: Path) -> Dict[str, Any]:
         return {}
 
 
-def safe_sleep(a=0.08, b=0.22):
+def safe_sleep(a: float = 0.08, b: float = 0.22) -> None:
     time.sleep(random.uniform(a, b))
 
 
@@ -88,7 +88,7 @@ def norm_spaces(s: str) -> str:
 
 
 def normalize_key(title: str, sku: str, color: str, url: str) -> str:
-    """优先用 sku+color，其次 title+color，最后回退 url 段"""
+    """优先用 sku+color，其次 title+color，最后回退 url 段。"""
     if sku and color:
         return f"{sku.lower()}::{color.lower()}"
     if title and color:
@@ -98,7 +98,7 @@ def normalize_key(title: str, sku: str, color: str, url: str) -> str:
     return f"{slug}::{(color or 'na').lower()}"
 
 
-def money_from_text(txt: str):
+def money_from_text(txt: str) -> Tuple[str, float]:
     """
     抽取货币符号与金额，例如 '$ 360.00' 或 'CA$ 360'。
     返回 (currency_symbol, price_float)；若失败 price=nan, symbol=''
@@ -119,10 +119,10 @@ def money_from_text(txt: str):
 # --------------------------
 
 def extract_collection_links(page) -> List[str]:
-    """收集集合页上的 PDP 链接"""
+    """收集集合页上的 PDP 链接。"""
     anchors = page.locator("a[href*='/arcteryx-'][href*='/p']")
     hrefs = anchors.evaluate_all("els => els.map(e => e.href)")
-    uniq = []
+    uniq: List[str] = []
     for h in hrefs:
         if "als.com" in h:
             h = h.split("#")[0]
@@ -132,7 +132,7 @@ def extract_collection_links(page) -> List[str]:
 
 
 def extract_sku(page) -> str:
-    """解析 SKU / Style number"""
+    """解析 SKU / Style number。"""
     try:
         txt = page.locator("body").inner_text()
         m = re.search(r"(X\d{9,12})", txt)
@@ -165,7 +165,7 @@ def extract_sku(page) -> str:
 
 
 def extract_color(page) -> str:
-    """解析颜色"""
+    """解析颜色。"""
     try:
         matches = page.locator("text=/Color\\s*:/i")
         if matches.count():
@@ -196,7 +196,7 @@ def extract_color(page) -> str:
 
 
 def extract_price(page) -> Tuple[str, float]:
-    """解析货币与价格"""
+    """解析货币与价格。"""
     for sel in [
         "[class*='price']",
         "[data-test*='price']",
@@ -282,7 +282,7 @@ def extract_sizes_with_qty(page) -> Dict[str, int]:
 
 
 def parse_product_detail(page) -> Dict[str, Any]:
-    """解析 PDP 所需字段"""
+    """解析 PDP 所需字段。"""
     data = {
         "title": "",
         "sku": "",
@@ -328,16 +328,10 @@ def parse_product_detail(page) -> Dict[str, Any]:
     return data
 
 
-def scrape_all_products(headless=True, timeout_ms=8000) -> Dict[str, Any]:
-    """遍历集合页 → 逐个 PDP 解析 → 返回以 variant key 为键的 dict（提速版）"""
+def scrape_all_products(headless: bool = True, timeout_ms: int = 8000) -> Dict[str, Any]:
+    """遍历集合页 → 逐个 PDP 解析 → 返回以 variant key 为键的 dict（加速版）。"""
     result: Dict[str, Any] = {}
     keyword = os.environ.get("KEYWORD_FILTER", "").strip().lower()
-    max_pages = None
-    try:
-        if os.environ.get("MAX_PAGES"):
-            max_pages = max(1, int(os.environ["MAX_PAGES"]))
-    except Exception:
-        max_pages = None
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=headless, args=["--disable-http-cache"])
@@ -359,8 +353,6 @@ def scrape_all_products(headless=True, timeout_ms=8000) -> Dict[str, Any]:
         seen_urls: Set[str] = set()
 
         while True:
-            if max_pages is not None and page_idx > max_pages:
-                break
             url = COLLECTION_URL if page_idx == 1 else f"{COLLECTION_URL}?page={page_idx}"
             try:
                 page.goto(url)
@@ -391,7 +383,7 @@ def scrape_all_products(headless=True, timeout_ms=8000) -> Dict[str, Any]:
                 safe_sleep()
 
                 ok = False
-                for attempt in range(2):  # 更少重试以提速
+                for attempt in range(2):  # 少量重试以提速
                     try:
                         page.goto(href)
                         page.wait_for_load_state("domcontentloaded")
@@ -439,7 +431,7 @@ def scrape_all_products(headless=True, timeout_ms=8000) -> Dict[str, Any]:
 # Diff & Notification
 # --------------------------
 
-def compute_diff(old: Dict[str, Any], new: Dict[str, Any]):
+def compute_diff(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
     """
     返回：
       new_items:        [(k, n)]
@@ -447,10 +439,10 @@ def compute_diff(old: Dict[str, Any], new: Dict[str, Any]):
       restocks:         [(k, o, n)]
       stock_increases:  [(k, o, n, increased_sizes_dict)]
     """
-    new_items = []
-    price_changes = []
-    restocks = []
-    stock_increases = []
+    new_items: List[Tuple[str, Dict[str, Any]]] = []
+    price_changes: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    restocks: List[Tuple[str, Dict[str, Any], Dict[str, Any]]] = []
+    stock_increases: List[Tuple[str, Dict[str, Any], Dict[str, Any], Dict[str, int]]] = []
 
     old_keys = set(old.keys())
     new_keys = set(new.keys())
@@ -505,7 +497,7 @@ def _fmt_currency_price(currency: str, price: float) -> str:
 
 
 def _fmt_sizes_line(sizes: Dict[str, int], only_keys: List[str] = None, limit: int = 8) -> str:
-    items = []
+    items: List[str] = []
     if only_keys:
         for k in only_keys:
             if k in sizes:
@@ -521,9 +513,9 @@ def _fmt_sizes_line(sizes: Dict[str, int], only_keys: List[str] = None, limit: i
 
 def build_item_message(n: Dict[str, Any], reasons: List[str], increased_sizes: List[str] = None) -> Dict[str, Any]:
     """
-    为单个商品构建 Discord payload（一个商品一条消息）
+    为单个商品构建 Discord payload（一个商品一条消息）。
     reasons: ["上新", "价格变化", "缺货→到货", "库存增加"]
-    increased_sizes: 当包含“库存增加”时，只展示有增长的尺码列表（可选）
+    increased_sizes: 当包含“库存增加”时，仅展示增长的尺码（可选）。
     """
     nm = n.get("title") or "-"
     sku = n.get("sku") or "-"
@@ -561,8 +553,8 @@ def build_item_message(n: Dict[str, Any], reasons: List[str], increased_sizes: L
 
 def send_discord(payload: dict) -> None:
     """
-    Discord Webhook 通知：仅必要请求头 + 重试
-    （去掉 Origin/Referer，避免 50067 Invalid request origin）
+    Discord Webhook 通知：仅必要请求头；单次发送（失败跳过）；轻微发送间隔避免 429。
+    （不带 Origin/Referer，规避 50067 Invalid request origin）
     """
     import urllib.request
     import urllib.error
@@ -587,50 +579,39 @@ def send_discord(payload: dict) -> None:
         ),
     }
 
-    for attempt in range(3):
+    try:
         req = urllib.request.Request(webhook, data=data, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                body = resp.read().decode("utf-8", "ignore")
-                print(f"Discord sent OK: {resp.status} {body[:120]}")
-                return
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", "ignore")
-            print(f"Discord HTTPError: {e.code} {body[:200]}")
-            if e.code in (429, 403, 502, 503) and attempt < 2:
-                wait = max(1.5 * (attempt + 1), float(e.headers.get("Retry-After", "0") or 0))
-                time.sleep(wait)
-                continue
-            return
-        except Exception as ex:
-            print(f"Discord error: {repr(ex)}")
-            if attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            return
+        with urllib.request.urlopen(req, timeout=7) as resp:
+            body = resp.read().decode("utf-8", "ignore")
+            print(f"Discord OK: {resp.status} {body[:120]}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        print(f"Discord HTTPError: {e.code} {body[:200]}")
+    except Exception as ex:
+        print(f"Discord error: {repr(ex)}")
+
+    # 发送间隔，避免频繁 429
+    time.sleep(float(os.environ.get("NOTIFY_INTERVAL_SEC", "0.1")))
 
 
 # --------------------------
 # Main
 # --------------------------
 
-def main():
+def main() -> int:
     print(f"CWD={os.getcwd()}  SNAPSHOT_PATH={SNAPSHOT_PATH.resolve()}")
     headless = os.environ.get("HEADLESS", "1") != "0"
 
     old = jload(SNAPSHOT_PATH)
     print(f"Loaded {len(old)} items from snapshot.")
 
-    # --- 抓取（提速配置见 scrape_all_products） ---
+    # 抓取
     new = scrape_all_products(headless=headless)
     print(f"Scraped {len(new)} items from website.")
 
-    # --- 计算差异 ---
+    # 计算差异 → “一商品一条”聚合
     diffs = compute_diff(old, new)
-    total_changed_keys: Set[str] = set()
 
-    # 将变化归并到“每个商品一条”的模型
-    # 先构建 key -> reasons 映射；库存增加需要记录增长的尺码名
     reasons_map: Dict[str, List[str]] = {}
     increased_sizes_map: Dict[str, List[str]] = {}
 
@@ -644,16 +625,15 @@ def main():
         reasons_map.setdefault(k, []).append("库存增加")
         increased_sizes_map[k] = list(inc.keys())
 
-    total_changed_keys = set(reasons_map.keys())
-    print("Changed items:", len(total_changed_keys))
+    changed_keys = sorted(set(reasons_map.keys()))
+    print("Changed items:", len(changed_keys))
 
-    # --- 写回快照 ---
+    # 写回快照
     jdump(new, SNAPSHOT_PATH)
 
-    # --- 只对有变化的商品逐条发消息 ---
-    if total_changed_keys:
-        # 注意：一个商品一条通知，包含合并的 reason
-        for k in sorted(total_changed_keys):
+    # 逐条通知（只对有变化的商品）
+    if changed_keys:
+        for k in changed_keys:
             n = new.get(k) or {}
             reasons = reasons_map.get(k, [])
             inc_sizes = increased_sizes_map.get(k)
